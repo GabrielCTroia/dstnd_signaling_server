@@ -11,10 +11,12 @@ use ws::{
     Sender,
 };
 
+// use std::error::Error;
 use std::cell::Cell;
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Result as SerdeResult, Value};
 
 use std::collections::HashMap;
 use std::sync::{
@@ -28,21 +30,46 @@ struct Server {
     count: Rc<Cell<u32>>,
     me: Option<String>,
     connections_map: Arc<Mutex<HashMap<String, String>>>,
+    peers: Arc<Mutex<HashMap<String, Sender>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct ConnectionOpenedPayload {
+struct MessagePayload<Content> {
+    message_type: String,
+    content: Content,
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct ConnectionLifecyleMessageContent {
     address: String,
-    connections_count: u32,
-    connections: HashMap<String, String>,
+    peers_count: u32,
+    peers_active: HashMap<String, String>,
+} 
+#[derive(Serialize, Deserialize, Debug)]
+struct PeerCallMessageContent {
+    peer_address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct ConnectionClosedPayload {
-    address: String,
-    connections_count: u32,
-    connections: HashMap<String, String>,
-}
+// #[derive(Serialize, Deserialize, Debug)]
+// #[serde(tag = "type")]
+// enum MessagePayloads {
+//     ConnectionLifecycle(MessagePayload<ConnectionLifecyleMessageContent>),
+//     PeerCall(MessagePayload<PeerCallMessageContent>),
+// }
+
+// #[derive(Serialize, Deserialize, Debug)]
+// struct ConnectionClosedPayload {
+//     message_type: String,
+//     content: {
+//         address: String,
+//         peers_count: u32,
+//         peers_active: HashMap<String, String>,
+//     }
+// }
+
+// #[derive(Serialize, Deserialize, Debug)]
+// struct ClientMessage {
+//     messate_type
+// }
 
 impl Handler for Server {
     fn on_request(&mut self, req: &Request) -> Result<(Response)> {
@@ -70,25 +97,32 @@ impl Handler for Server {
 
         self.me = Some(peer_id.to_string());
 
-        println!("New Connection Opened {}", peer_id);
-
         // We have a new connection, so we increment the connection counter
         self.count.set(self.count.get() + 1);
         let number_of_connection = self.count.get();
         
         let mut connections = self.connections_map.lock().unwrap();
-
         connections.insert(peer_id.to_string(), peer_id.to_string());
 
-        let payload = ConnectionOpenedPayload {
+        let mut peers = self.peers.lock().unwrap();
+        peers.insert(peer_id.to_string(), self.sender.clone());
+
+        let content = ConnectionLifecyleMessageContent {
             address: peer_id.to_string(),
-            connections_count: number_of_connection,
-            connections: connections.clone(),
+            peers_count: number_of_connection,
+            peers_active: connections.clone(),
         };
+
+        let payload = MessagePayload {
+            message_type: String::from("connection_opened"),
+            content,
+        };
+
         let serialized = serde_json::to_string(&payload).unwrap();
 
-        println!("Response {}", &serialized);
-        self.sender.broadcast(serialized);
+        println!("New Connection Opened {}", peer_id);
+
+        self.sender.send(serialized);
 
         Ok(())
     }
@@ -98,17 +132,80 @@ impl Handler for Server {
         let raw_message = message.into_text()?;
         println!("The message from the client is {:#?}", &raw_message);
 
-        let message = if raw_message.contains("!warn") {
-            let warn_message = "One of the clients sent warning to the server.";
-            println!("{}", &warn_message);
-            Message::Text("There was warning from another user.".to_string())
-        } else {
-            Message::Text(raw_message)
-        };
+        // let message = if raw_message.contains("!warn") {
+        //     let warn_message = "One of the clients sent warning to the server.";
+        //     println!("{}", &warn_message);
+        //     Message::Text("There was warning from another user.".to_string())
+        // } else {
+        //     Message::Text(raw_message)
+        // };
+
+        // let v: Message = serde_json::from_str(&raw_message)?;
+        // let v: Value = ;
+
+        // if let Ok(json) = serde_json::from_str(&raw_message) {
+
+        // }
+
+        let v: MessagePayload<PeerCallMessageContent> = serde_json::from_str(&raw_message).unwrap();
+        // let v: MessagePayloads = match serde_json::from_str(&raw_message) {
+            
+        // }
+        if (v.message_type == "peer_call") {
+            println!("Going to call {}", v.content.peer_address);
+
+            if let peers = self.peers.lock().unwrap() {
+                peers.get(&v.content.peer_address);
+                println!("Trying to match peer {:?}", peers);
+            } else {
+                println!("Didn't mtch");
+            }
+
+
+            if let Some(peer) = self.peers.lock().unwrap().get(&v.content.peer_address) {
+                peer.send(raw_message);
+                println!("Message sent to peer {}", v.content.peer_address);
+                // peer.Sender
+            } else {
+                println!("Message not able to send, {}", v.content.peer_address);
+                println!("All peers {:?}", self.peers);
+            }
+
+            
+        }
+
+        // let v:MessagePayload<PeerCallMessageContent> = serde_json::from_str(&raw_message).unwrap();
+
+
+        println!("V {:#?}", v);
+        // if let v: MessagePayload<PeerCallMessageContent> = match serde_json::from_str(&raw_message) {
+
+        // }
+
+        // let v: Option<MessagePayload<PeerCallMessageContent>> = match serde_json::from_str(&raw_message) {
+        //     Ok(json) => json,
+        //     Err(e) => Err(),
+        // };
+
+        // if (v["message_type"] == "peer_call") {
+        //     let peer_addr: String = v["content"]["peer_address"];
+
+            
+        //     // println!("peer calling, {:?}", );
+        // }
+
+        // println!("V {:?}", v["message_type"]);
+
+        // let peers  = self.peers.lock().unwrap();
+
+        // peers.get(String::from("").as_ref()).unwrap().send(String::from(" works "));
+
+        // self.sender.send
 
         // Broadcast to all connections including other servers:
         // See: https://docs.rs/ws/0.9.1/ws/struct.Sender.html#method.broadcast
-        self.sender.broadcast(message)
+        // self.sender.broadcast(message)
+        Ok(())
     }
 
     fn on_close(&mut self, code: CloseCode, reason: &str) {
@@ -125,22 +222,30 @@ impl Handler for Server {
             self.count.set(self.count.get() - 1);
 
             let mut connections = self.connections_map.lock().unwrap();
-
             connections.remove(me);
+
+            let mut peers = self.peers.lock().unwrap();
+            peers.remove(me);
 
             // Once a connecton closes broadcast it
             let number_of_connection = self.count.get();
 
-            let payload = ConnectionClosedPayload {
+            let content = ConnectionLifecyleMessageContent {
                 address: me.to_string(),
-                connections_count: number_of_connection,
-                connections: connections.clone(),
+                peers_count: number_of_connection,
+                peers_active: connections.clone(),
             };
+    
+            let payload = MessagePayload {
+                message_type: String::from("connection_closed"),
+                content,
+            };
+
             let serialized = serde_json::to_string(&payload).unwrap();
 
             println!("{}", &serialized);
 
-            self.sender.broadcast(serialized);
+            // self.sender.broadcast(serialized);
         } else {
             println!("The previous connection attempted to close whith no active connection.");
         }
@@ -165,9 +270,11 @@ pub fn websocket() -> () {
     // let connections = Rc::new(Cell::new(vec![]));
     // let mut connections:Vec<String>  = vec![];
     let mut connections_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut peers: Arc<Mutex<HashMap<String, Sender>>> = Arc::new(Mutex::new(HashMap::new()));
 
     listen("127.0.0.1:7777", |sender| Server {
         sender,
+        peers: peers.clone(),
         count: count.clone(),
         connections_map: connections_map.clone(),
         me: None,
