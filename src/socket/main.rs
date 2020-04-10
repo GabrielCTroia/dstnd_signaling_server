@@ -1,3 +1,11 @@
+// Heavily inspired, taken from:
+// https://www.steadylearner.com/blog/read/How-to-start-Rust-Chat-App
+// https://github.com/housleyjk/ws-site-chat/blob/master/src/main.rs
+// https://github.com/jonalmeida/ws-p2p/blob/master/src/handler.rs
+//
+// Also see:
+// https://www.reddit.com/r/rust/comments/7drfuv/trying_to_understand_websockets/
+
 use ws::{
     listen, CloseCode, Error, Handler, Handshake, Message, Request, Response, Result,
     Sender,
@@ -8,21 +16,32 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    Mutex,
+};
+
 // Server web application handler
 struct Server {
-    out: Sender,
+    sender: Sender,
     count: Rc<Cell<u32>>,
+    me: Option<String>,
+    connections_map: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ConnectionOpenedPayload {
-    new_connection: String,
+    address: String,
     connections_count: u32,
+    connections: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ConnectionClosedPayload {
+    address: String,
     connections_count: u32,
+    connections: HashMap<String, String>,
 }
 
 impl Handler for Server {
@@ -47,24 +66,29 @@ impl Handler for Server {
     }
 
     fn on_open(&mut self, handshake: Handshake) -> Result<()> {
+        let peer_id = &handshake.peer_addr.unwrap().to_string();
+
+        self.me = Some(peer_id.to_string());
+
+        println!("New Connection Opened {}", peer_id);
+
         // We have a new connection, so we increment the connection counter
         self.count.set(self.count.get() + 1);
         let number_of_connection = self.count.get();
+        
+        let mut connections = self.connections_map.lock().unwrap();
 
-        if number_of_connection > 5 {
-            // panic!("There are more user connection than expected.");
-        }
-
-        let peer_id = &handshake.peer_addr.unwrap().to_string();
+        connections.insert(peer_id.to_string(), peer_id.to_string());
 
         let payload = ConnectionOpenedPayload {
-            new_connection: peer_id.to_string(),
+            address: peer_id.to_string(),
             connections_count: number_of_connection,
+            connections: connections.clone(),
         };
         let serialized = serde_json::to_string(&payload).unwrap();
 
-        println!("{}", &serialized);
-        self.out.broadcast(serialized);
+        println!("Response {}", &serialized);
+        self.sender.broadcast(serialized);
 
         Ok(())
     }
@@ -82,8 +106,9 @@ impl Handler for Server {
             Message::Text(raw_message)
         };
 
-        // Broadcast to all connections
-        self.out.broadcast(message)
+        // Broadcast to all connections including other servers:
+        // See: https://docs.rs/ws/0.9.1/ws/struct.Sender.html#method.broadcast
+        self.sender.broadcast(message)
     }
 
     fn on_close(&mut self, code: CloseCode, reason: &str) {
@@ -95,18 +120,30 @@ impl Handler for Server {
             }
             _ => println!("The client encountered an error: {}", reason),
         }
-        self.count.set(self.count.get() - 1);
 
-        // Once a connecton closes broadcast it
-        let number_of_connection = self.count.get();
+        if let Some(me) = self.me.as_ref() {
+            self.count.set(self.count.get() - 1);
 
-        let payload = ConnectionClosedPayload {
-            connections_count: number_of_connection,
-        };
-        let serialized = serde_json::to_string(&payload).unwrap();
+            let mut connections = self.connections_map.lock().unwrap();
 
-        println!("{}", &serialized);
-        self.out.broadcast(serialized);
+            connections.remove(me);
+
+            // Once a connecton closes broadcast it
+            let number_of_connection = self.count.get();
+
+            let payload = ConnectionClosedPayload {
+                address: me.to_string(),
+                connections_count: number_of_connection,
+                connections: connections.clone(),
+            };
+            let serialized = serde_json::to_string(&payload).unwrap();
+
+            println!("{}", &serialized);
+
+            self.sender.broadcast(serialized);
+        } else {
+            println!("The previous connection attempted to close whith no active connection.");
+        }
     }
 
     fn on_error(&mut self, err: Error) {
@@ -125,9 +162,15 @@ pub fn websocket() -> () {
 
     // Listen on an address and call the closure for each connection
     let count = Rc::new(Cell::new(0));
-    listen("127.0.0.1:7777", |out| Server {
-        out: out,
+    // let connections = Rc::new(Cell::new(vec![]));
+    // let mut connections:Vec<String>  = vec![];
+    let mut connections_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    listen("127.0.0.1:7777", |sender| Server {
+        sender,
         count: count.clone(),
+        connections_map: connections_map.clone(),
+        me: None,
     })
     .unwrap()
 }
