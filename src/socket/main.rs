@@ -40,6 +40,7 @@ struct Server {
 enum MsgType {
     ConnectionOpened,
     PeerNetworkRefresh,
+    P2PCommunication,
     PeerCall,
 }
 
@@ -68,6 +69,13 @@ struct PeerCallMsgContent {
     peer_address: String,
 }
 
+// msg_type: "p2p_ommunication"
+#[derive(Serialize, Deserialize, Debug)]
+struct P2PCommunicationMsgContent {
+    peer_address: String,
+    forward: String,
+}
+
 
 fn serialize_msg<MsgContent: serde::Serialize>(
     msg_type: MsgType,
@@ -77,6 +85,7 @@ fn serialize_msg<MsgContent: serde::Serialize>(
         MsgType::ConnectionOpened => "connection_opened",
         MsgType::PeerNetworkRefresh => "peer_network_refresh",
         MsgType::PeerCall => "peer_call",
+        MsgType::P2PCommunication => "p2p_communication",
     };
 
     let msg = MsgEnvelope {
@@ -217,20 +226,41 @@ impl Handler for Server {
     fn on_message(&mut self, message: Message) -> WSResult<()> {
         let raw_message = message.into_text()?;
         println!("The message from the client is {:#?}", &raw_message);
+        // println!("Message received from client");
 
-        match serde_json::from_str::<MsgEnvelope<PeerCallMsgContent>>(&raw_message) {
+        // TODO This needs to be refactored a bit to pattern match per message_type
+        //  But it's OK for now, until I get more knowledge on how the whole
+        //  infrastructure looks like
+        match serde_json::from_str::<MsgEnvelope<P2PCommunicationMsgContent>>(&raw_message) {
             Ok (msg) => {
-                if msg.msg_type == "peer_call" {
+                if msg.msg_type == "p2p_communication" {
+                    // TODO: This should read it super fast so maybe no lock() if possible since it's just a read
                     if let Some(peer) = self.peers.lock().unwrap().get(&msg.content.peer_address) {
-                        peer.sender.send(raw_message);
-                        println!("Message sent to peer {}", msg.content.peer_address);
+                        if let Some(me) = self.me.as_ref() {
+                            // Set the peer_address to the "from" peer so it knows where to send it back
+                            let msg_with_interchanged_peer = serialize_msg(
+                                MsgType::P2PCommunication,
+                                P2PCommunicationMsgContent {
+                                    peer_address: me.to_string(),
+                                    forward: msg.content.forward,
+                                },
+                            );
+
+                            peer.sender.send(String::from(msg_with_interchanged_peer.clone()));
+
+                            println!("Message forwarded to peer {:?}", msg_with_interchanged_peer);
+                        } else {
+                            println!("No self.me Error");
+                        }
                     } else {
-                        println!("Message not able to send, {}", msg.content.peer_address);
+                        println!("Can't get peer by address, {}", msg.content.peer_address);
                     }
+                } else {
+                    println!("Message not p2p_communication, {:?}", msg);
                 }
             },
             Err(e) => {
-                println!("Some error {:?}", e);
+                println!("Not a P2PCommunicationMsgContent {:?}", e);
             }
         }
 
