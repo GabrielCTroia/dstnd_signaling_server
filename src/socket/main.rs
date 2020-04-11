@@ -7,7 +7,7 @@
 // https://www.reddit.com/r/rust/comments/7drfuv/trying_to_understand_websockets/
 
 use ws::{
-    listen, CloseCode, Error, Handler, Handshake, Message, Request, Response, Result,
+    listen, CloseCode, Error, Handler, Handshake, Message, Request, Response, Result as WSResult,
     Sender,
 };
 
@@ -19,60 +19,113 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Result as SerdeResult, Value};
 
 use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    Mutex,
-};
+use std::sync::{Arc, Mutex};
 
+#[derive(Debug)]
+struct Peer {
+    sender: Sender,
+    peer_addr: String,
+}
 // Server web application handler
 struct Server {
     sender: Sender,
-    count: Rc<Cell<u32>>,
     me: Option<String>,
-    connections_map: Arc<Mutex<HashMap<String, String>>>,
-    peers: Arc<Mutex<HashMap<String, Sender>>>,
+    peers: Arc<Mutex<HashMap<String, Peer>>>,
+    
+    // Deprecate
+    // count: Rc<Cell<u32>>,
+    // connections_map: Arc<Mutex<HashMap<String, String>>>,
+}
+
+enum MsgType {
+    ConnectionOpened,
+    PeerNetworkRefresh,
+    PeerCall,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct MessagePayload<Content> {
-    message_type: String,
+struct MsgEnvelope<Content> {
+    msg_type: String,
     content: Content,
 }
+
+// msg_type: "connection_opened"
 #[derive(Serialize, Deserialize, Debug)]
-struct ConnectionLifecyleMessageContent {
-    address: String,
-    peers_count: u32,
-    peers_active: HashMap<String, String>,
-} 
+struct ConnectionOpenedMsgContent {
+    my_address: String,
+}
+
+// msg_type: "network_status_change"
 #[derive(Serialize, Deserialize, Debug)]
-struct PeerCallMessageContent {
+struct NetworkStatusChangeMsgContent {
+    count: u32,
+    peers: HashMap<String, String>,
+}
+
+// msg_type: "peer_call"
+#[derive(Serialize, Deserialize, Debug)]
+struct PeerCallMsgContent {
     peer_address: String,
 }
 
-// #[derive(Serialize, Deserialize, Debug)]
-// #[serde(tag = "type")]
-// enum MessagePayloads {
-//     ConnectionLifecycle(MessagePayload<ConnectionLifecyleMessageContent>),
-//     PeerCall(MessagePayload<PeerCallMessageContent>),
-// }
 
-// #[derive(Serialize, Deserialize, Debug)]
-// struct ConnectionClosedPayload {
-//     message_type: String,
-//     content: {
-//         address: String,
-//         peers_count: u32,
-//         peers_active: HashMap<String, String>,
-//     }
-// }
+fn serialize_msg<MsgContent: serde::Serialize>(
+    msg_type: MsgType,
+    content: MsgContent,
+) -> String {
+    let msg_type = match msg_type {
+        MsgType::ConnectionOpened => "connection_opened",
+        MsgType::PeerNetworkRefresh => "peer_network_refresh",
+        MsgType::PeerCall => "peer_call",
+    };
 
-// #[derive(Serialize, Deserialize, Debug)]
-// struct ClientMessage {
-//     messate_type
-// }
+    let msg = MsgEnvelope {
+        msg_type: String::from(msg_type),
+        content,
+    };
+
+    serde_json::to_string(&msg).unwrap()
+}
+
+type PeerAddressesMap = HashMap<String, String>;
+
+trait PeerNetworkStatus {
+    fn insert_peer_address(&self, addr: String);
+    fn remove_peer_address(&self, addr: String);
+    fn all_peer_addresses(&self) -> PeerAddressesMap;
+}
+
+impl PeerNetworkStatus for Server {
+    fn insert_peer_address(&self, addr: String) {
+        let mut peers = self.peers.lock().unwrap();
+
+        peers.insert(addr.to_string(), Peer {
+            peer_addr: addr.to_string(),
+            sender: self.sender.clone(),
+        });
+    }
+
+    fn remove_peer_address(&self, addr: String) {
+        let mut peers = self.peers.lock().unwrap();
+        
+        peers.remove(&addr);
+    }
+
+    fn all_peer_addresses(&self) -> PeerAddressesMap {
+        let peers = self.peers.lock().unwrap();
+
+        let peers_address_map: HashMap<String, String> = peers.iter().map(|(key, _)| {
+            // Since the peers already idexes by address I can simply just used that
+            let peer_addr = String::from(key);
+            (peer_addr.to_string(), peer_addr.to_string())
+        }).collect();
+
+        peers_address_map
+    }
+}
 
 impl Handler for Server {
-    fn on_request(&mut self, req: &Request) -> Result<(Response)> {
+    fn on_request(&mut self, req: &Request) -> WSResult<(Response)> {
         match req.resource() {
             "/ws" => {
                 // used once for const socket = new WebSocket("ws://" + window.location.host + "/ws");
@@ -92,121 +145,42 @@ impl Handler for Server {
         }
     }
 
-    fn on_open(&mut self, handshake: Handshake) -> Result<()> {
-        let peer_id = &handshake.peer_addr.unwrap().to_string();
+    fn on_open(&mut self, handshake: Handshake) -> WSResult<()> {
+        let me = &handshake.peer_addr.unwrap();
+        println!("Connection opened for {:?}", me);
 
-        self.me = Some(peer_id.to_string());
+        // Send the ConnectionOpened Message to the "me" peer 
+        let msg_to_me = serialize_msg(
+            MsgType::ConnectionOpened,
+            ConnectionOpenedMsgContent {
+                my_address: me.to_string(),
+            },
+        );
 
-        // We have a new connection, so we increment the connection counter
-        self.count.set(self.count.get() + 1);
-        let number_of_connection = self.count.get();
+        self.sender.send(msg_to_me.to_string());
+
+        // Update the Network Status
+        self.me = Some(me.to_string());
+        self.insert_peer_address(me.to_string());
         
-        let mut connections = self.connections_map.lock().unwrap();
-        connections.insert(peer_id.to_string(), peer_id.to_string());
+        let next_peers = self.all_peer_addresses();
 
-        let mut peers = self.peers.lock().unwrap();
-        peers.insert(peer_id.to_string(), self.sender.clone());
-
-        let content = ConnectionLifecyleMessageContent {
-            address: peer_id.to_string(),
-            peers_count: number_of_connection,
-            peers_active: connections.clone(),
-        };
-
-        let payload = MessagePayload {
-            message_type: String::from("connection_opened"),
-            content,
-        };
-
-        let serialized = serde_json::to_string(&payload).unwrap();
-
-        println!("New Connection Opened {}", peer_id);
-
-        self.sender.send(serialized);
-
-        Ok(())
-    }
-
-    // Handle messages recieved in the websocket (in this case, only on /ws)
-    fn on_message(&mut self, message: Message) -> Result<()> {
-        let raw_message = message.into_text()?;
-        println!("The message from the client is {:#?}", &raw_message);
-
-        // let message = if raw_message.contains("!warn") {
-        //     let warn_message = "One of the clients sent warning to the server.";
-        //     println!("{}", &warn_message);
-        //     Message::Text("There was warning from another user.".to_string())
-        // } else {
-        //     Message::Text(raw_message)
-        // };
-
-        // let v: Message = serde_json::from_str(&raw_message)?;
-        // let v: Value = ;
-
-        // if let Ok(json) = serde_json::from_str(&raw_message) {
-
-        // }
-
-        let v: MessagePayload<PeerCallMessageContent> = serde_json::from_str(&raw_message).unwrap();
-        // let v: MessagePayloads = match serde_json::from_str(&raw_message) {
-            
-        // }
-        if (v.message_type == "peer_call") {
-            println!("Going to call {}", v.content.peer_address);
-
-            if let peers = self.peers.lock().unwrap() {
-                peers.get(&v.content.peer_address);
-                println!("Trying to match peer {:?}", peers);
-            } else {
-                println!("Didn't mtch");
-            }
-
-
-            if let Some(peer) = self.peers.lock().unwrap().get(&v.content.peer_address) {
-                peer.send(raw_message);
-                println!("Message sent to peer {}", v.content.peer_address);
-                // peer.Sender
-            } else {
-                println!("Message not able to send, {}", v.content.peer_address);
-                println!("All peers {:?}", self.peers);
-            }
-
-            
-        }
-
-        // let v:MessagePayload<PeerCallMessageContent> = serde_json::from_str(&raw_message).unwrap();
-
-
-        println!("V {:#?}", v);
-        // if let v: MessagePayload<PeerCallMessageContent> = match serde_json::from_str(&raw_message) {
-
-        // }
-
-        // let v: Option<MessagePayload<PeerCallMessageContent>> = match serde_json::from_str(&raw_message) {
-        //     Ok(json) => json,
-        //     Err(e) => Err(),
-        // };
-
-        // if (v["message_type"] == "peer_call") {
-        //     let peer_addr: String = v["content"]["peer_address"];
-
-            
-        //     // println!("peer calling, {:?}", );
-        // }
-
-        // println!("V {:?}", v["message_type"]);
-
-        // let peers  = self.peers.lock().unwrap();
-
-        // peers.get(String::from("").as_ref()).unwrap().send(String::from(" works "));
-
-        // self.sender.send
-
+        // Broadcast the Updated Network Status to all the peers
+        let msg_to_all = serialize_msg(
+            MsgType::PeerNetworkRefresh,
+            NetworkStatusChangeMsgContent {
+                count: next_peers.len() as u32,
+                peers: next_peers,
+            },
+        );
+        
         // Broadcast to all connections including other servers:
         // See: https://docs.rs/ws/0.9.1/ws/struct.Sender.html#method.broadcast
-        // self.sender.broadcast(message)
+        self.sender.broadcast(msg_to_all);
+
         Ok(())
     }
+
 
     fn on_close(&mut self, code: CloseCode, reason: &str) {
         match code {
@@ -219,36 +193,48 @@ impl Handler for Server {
         }
 
         if let Some(me) = self.me.as_ref() {
-            self.count.set(self.count.get() - 1);
+            self.remove_peer_address(me.to_string());
 
-            let mut connections = self.connections_map.lock().unwrap();
-            connections.remove(me);
+            let next_peers = self.all_peer_addresses();
 
-            let mut peers = self.peers.lock().unwrap();
-            peers.remove(me);
+            let msg_to_all = serialize_msg(
+                MsgType::PeerNetworkRefresh,
+                NetworkStatusChangeMsgContent {
+                    count: next_peers.len() as u32,
+                    peers: next_peers.clone(),
+                }
+            );
 
-            // Once a connecton closes broadcast it
-            let number_of_connection = self.count.get();
-
-            let content = ConnectionLifecyleMessageContent {
-                address: me.to_string(),
-                peers_count: number_of_connection,
-                peers_active: connections.clone(),
-            };
-    
-            let payload = MessagePayload {
-                message_type: String::from("connection_closed"),
-                content,
-            };
-
-            let serialized = serde_json::to_string(&payload).unwrap();
-
-            println!("{}", &serialized);
-
-            // self.sender.broadcast(serialized);
+            // Broadcast to all connections including other servers:
+            // See: https://docs.rs/ws/0.9.1/ws/struct.Sender.html#method.broadcast
+            self.sender.broadcast(msg_to_all);
         } else {
             println!("The previous connection attempted to close whith no active connection.");
         }
+    }
+
+    // Handle messages recieved in the websocket (in this case, only on /ws)
+    fn on_message(&mut self, message: Message) -> WSResult<()> {
+        let raw_message = message.into_text()?;
+        println!("The message from the client is {:#?}", &raw_message);
+
+        match serde_json::from_str::<MsgEnvelope<PeerCallMsgContent>>(&raw_message) {
+            Ok (msg) => {
+                if msg.msg_type == "peer_call" {
+                    if let Some(peer) = self.peers.lock().unwrap().get(&msg.content.peer_address) {
+                        peer.sender.send(raw_message);
+                        println!("Message sent to peer {}", msg.content.peer_address);
+                    } else {
+                        println!("Message not able to send, {}", msg.content.peer_address);
+                    }
+                }
+            },
+            Err(e) => {
+                println!("Some error {:?}", e);
+            }
+        }
+
+        Ok(())
     }
 
     fn on_error(&mut self, err: Error) {
@@ -260,23 +246,12 @@ pub fn websocket() -> () {
     println!("Web Socket Server is ready at ws://127.0.0.1:7777/ws");
     println!("Server is ready at http://127.0.0.1:7777/");
 
-    // Rc is a reference-counted box for sharing the count between handlers
-    // since each handler needs to own its contents.
-    // Cell gives us interior mutability so we can increment
-    // or decrement the count between handlers.
-
+    let mut peers: Arc<Mutex<HashMap<String, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
+    
     // Listen on an address and call the closure for each connection
-    let count = Rc::new(Cell::new(0));
-    // let connections = Rc::new(Cell::new(vec![]));
-    // let mut connections:Vec<String>  = vec![];
-    let mut connections_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mut peers: Arc<Mutex<HashMap<String, Sender>>> = Arc::new(Mutex::new(HashMap::new()));
-
     listen("127.0.0.1:7777", |sender| Server {
         sender,
         peers: peers.clone(),
-        count: count.clone(),
-        connections_map: connections_map.clone(),
         me: None,
     })
     .unwrap()
